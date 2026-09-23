@@ -202,9 +202,187 @@ plot_turbine_loss_bar(
 print("   ✓ 损失柱状图已生成")
 
 print("\n" + "=" * 60)
+print("多机型混装测试")
+print("=" * 60)
+
+print("\n10. 测试多机型机队配置与独立实例...")
+from wind_farm_opt.config import WindFarmConfig, ConfigError, VisualizationConfig
+from wind_farm_opt.constraints.spacing import pairwise_min_spacings
+
+_no_plots = VisualizationConfig(save_plots=False)
+fleet_cfg = WindFarmConfig(
+    boundary_type="rectangular",
+    boundary_params={"width": 4000, "height": 3500},
+    visualization=_no_plots,
+)
+fleet_cfg.load_fleet_block({"turbine_types": [
+    {"model": "V126-3.45MW", "count": 3},
+    {"model": "V164-9.5MW", "count": 2},
+]})
+fleet_turbines = fleet_cfg.create_turbines()
+assert len(fleet_turbines) == 5
+assert [t.turbine_id for t in fleet_turbines] == ["WT-01", "WT-02", "WT-03", "WT-04", "WT-05"]
+assert [t.name for t in fleet_turbines] == ["V126-3.45MW"] * 3 + ["V164-9.5MW"] * 2
+# 实例与功率曲线互相独立
+assert fleet_turbines[0] is not fleet_turbines[1]
+assert fleet_turbines[0].power_curve is not fleet_turbines[1].power_curve
+comp = fleet_cfg.fleet_composition(fleet_turbines)
+assert comp[0]["count"] == 3 and comp[1]["count"] == 2
+assert abs(comp[0]["capacity_mw"] - 3 * 3.45) < 1e-9
+assert abs(comp[1]["capacity_mw"] - 2 * 9.5) < 1e-9
+print("   ✓ 按型号数量生成 5 台独立机组，稳定编号连续")
+print("   ✓ 机队容量明细: "
+      + ", ".join(f"{c['model']}×{c['count']}={c['capacity_mw']:.2f}MW" for c in comp))
+
+# 逐机清单 + 自定义机型
+manifest = WindFarmConfig(boundary_params={"width": 4000, "height": 4000},
+                          visualization=_no_plots)
+manifest.load_fleet_block({
+    "turbines": [
+        {"id": "OLD-A", "model": "V126-3.45MW"},
+        {"id": "BIG-B", "model": "V150-6.0MW"},
+    ],
+    "catalog": {"V150-6.0MW": {
+        "rotor_diameter": 150.0, "rated_power_kw": 6000.0,
+        "hub_height": 100.0,
+    }},
+})
+units = manifest.create_turbines()
+assert [t.turbine_id for t in units] == ["OLD-A", "BIG-B"]
+assert units[1].rotor_diameter == 150.0 and units[1].rated_power == 6000.0
+print("   ✓ 逐机清单按自定义编号生成，catalog 自定义机型生效")
+
+print("\n11. 测试基于各自直径的逐对间距规则...")
+diameters = np.array([t.rotor_diameter for t in fleet_turbines])
+S = pairwise_min_spacings(diameters, min_multiple=5.0)
+# 同型号对 = 5D；混合对 = 5*(D1+D2)/2
+assert abs(S[0, 1] - 5.0 * 126.0) < 1e-9
+assert abs(S[3, 4] - 5.0 * 164.0) < 1e-9
+assert abs(S[0, 3] - 5.0 * (126.0 + 164.0) / 2.0) < 1e-9
+assert S[0, 3] < S[3, 4], "小-大机组对间距应小于大-大机组对，避免场地浪费"
+# 同直径机队退化为旧的全场统一 5D
+S_homo = pairwise_min_spacings(np.full(4, 126.0), 5.0)
+assert np.allclose(S_homo[S_homo > 0], 5.0 * 126.0)
+print(f"   ✓ 小-小 {S[0,1]:.0f} m, 小-大 {S[0,3]:.0f} m, 大-大 {S[3,4]:.0f} m")
+print("   ✓ 同型号机队逐对规则与旧的 k·D 完全等价")
+
+print("\n12. 测试多机型 AEP（各机组自身功率/推力特性）...")
+from wind_farm_opt.farm.aep import AEPCalculator
+from wind_farm_opt.optimization.baseline import generate_grid_layout
+
+f_boundary = fleet_cfg.create_boundary()
+f_wr = fleet_cfg.create_wind_resource()
+f_rng = np.random.default_rng(7)
+f_pos = generate_grid_layout(
+    f_boundary, 5, diameters, min_multiple=5.0, rng=f_rng, spacing_matrix=S,
+)
+f_aep = AEPCalculator(fleet_turbines, f_wr, JensenWake(0.07), speed_step=1.0)
+f_result = f_aep.compute_farm_aep(f_pos)
+assert abs(f_result.total_installed_capacity - (3 * 3.45 + 2 * 9.5)) < 1e-9
+by_model = f_result.model_summary
+assert set(by_model) == {"V126-3.45MW", "V164-9.5MW"}
+assert by_model["V164-9.5MW"]["count"] == 2
+tr = f_result.turbine_results[3]
+assert tr.name == "V164-9.5MW" and tr.turbine_id == "WT-04"
+assert abs(tr.rated_power_kw - 9500.0) < 1e-9 and tr.rotor_diameter == 164.0
+# 同位置单机 AEP 应只取决于自身功率曲线：大机组毛发电量显著更高
+small_gross = f_result.turbine_results[0].gross_aep
+big_gross = f_result.turbine_results[3].gross_aep
+assert big_gross > small_gross * 2.0
+print(f"   ✓ 总装机 {f_result.total_installed_capacity:.2f} MW")
+print(f"   ✓ 型号汇总保留: " + ", ".join(
+    f"{m} {v['count']}台/{v['net_aep_mwh']/1e3:.1f}GWh" for m, v in by_model.items()))
+print(f"   ✓ 同布局大机组毛AEP {big_gross:.0f} vs 小机组 {small_gross:.0f} MWh（各用自身功率曲线）")
+
+print("\n13. 测试多机型 GA/PSO 贯穿逐对间距约束...")
+from wind_farm_opt.optimization.ga import GeneticAlgorithm, GAConfig
+from wind_farm_opt.optimization.pso import ParticleSwarmOptimizer, PSOConfig
+from wind_farm_opt.constraints.spacing import check_pairwise_spacing
+
+mixed_ga = GeneticAlgorithm(
+    n_turbines=5, rotor_diameters=diameters, boundary=f_boundary,
+    fitness_fn=f_aep.evaluate_layout, spacing_matrix=S,
+    config=GAConfig(population_size=6, max_generations=3, seed=1),
+)
+ga_res = mixed_ga.optimize(verbose=False)
+ok_ga, _ = check_pairwise_spacing(ga_res.best_positions, S)
+assert ok_ga, "GA 最优解必须满足逐对间距"
+
+mixed_pso = ParticleSwarmOptimizer(
+    n_turbines=5, rotor_diameters=diameters, boundary=f_boundary,
+    fitness_fn=f_aep.evaluate_layout, spacing_matrix=S,
+    config=PSOConfig(swarm_size=6, max_iterations=3, seed=1),
+)
+pso_res = mixed_pso.optimize(verbose=False)
+ok_pso, _ = check_pairwise_spacing(pso_res.best_positions, S)
+assert ok_pso, "PSO 最优解必须满足逐对间距"
+print(f"   ✓ GA 最优 AEP {ga_res.best_fitness/1e3:.2f} GWh，逐对间距全部满足")
+print(f"   ✓ PSO 最优 AEP {pso_res.best_fitness/1e3:.2f} GWh，逐对间距全部满足")
+
+print("\n14. 测试多机型经济性分析（分型号成本与容量）...")
+from wind_farm_opt.economy.costs import (
+    EconomicAnalyzer,
+    get_default_turbine_cost,
+    get_default_farm_cost,
+)
+analyzer_mix = EconomicAnalyzer(
+    turbine_cost=get_default_turbine_cost("V126-3.45MW"),
+    farm_cost=get_default_farm_cost(),
+    electricity_price=0.45,
+    turbine_costs=fleet_cfg.build_cost_models(),
+)
+fleet_items = [
+    {"model": "V126-3.45MW", "count": 3, "rated_power_mw": 3.45},
+    {"model": "V164-9.5MW", "count": 2, "rated_power_mw": 9.5},
+]
+econ_mix = analyzer_mix.analyze_fleet(fleet_items, f_result.net_aep / 1e3)
+assert len(econ_mix.model_breakdown) == 2
+assert abs(sum(m["capacity_mw"] for m in econ_mix.model_breakdown)
+           - econ_mix.total_installed_capacity) < 1e-9
+cap_cost = sum(m["capital_cost"] for m in econ_mix.model_breakdown)
+assert cap_cost > 0
+print(f"   ✓ LCOE {econ_mix.lcoe:.3f} 元/kWh，分型号明细 {len(econ_mix.model_breakdown)} 条")
+
+print("\n15. 测试配置诊断的可操作性...")
+def expect_config_error(label, data):
+    import tempfile, json as _json
+    p = tempfile.mktemp(suffix=".json")
+    _json.dump(data, open(p, "w"))
+    try:
+        WindFarmConfig.from_json(p)
+        raise AssertionError(f"{label} 应当报错")
+    except ConfigError:
+        pass
+
+expect_config_error("未知型号", {"fleet": {"turbine_types": [{"model": "NA", "count": 1}]}})
+expect_config_error("count非正", {"fleet": {"turbine_types": [{"model": "V126-3.45MW", "count": 0}]}})
+expect_config_error("重复编号", {"fleet": {"turbines": [
+    {"id": "A", "model": "V126-3.45MW"}, {"id": "A", "model": "V126-3.45MW"}]}})
+expect_config_error("部分坐标", {"fleet": {"turbines": [
+    {"id": "A", "model": "V126-3.45MW", "position": [0, 0]},
+    {"id": "B", "model": "V126-3.45MW"}]}})
+print("   ✓ 未知型号 / 非法数量 / 重复编号 / 坐标缺失 均有明确诊断")
+
+# 场地无法容纳在基线生成阶段诊断（RuntimeError，含处置建议）
+tiny = WindFarmConfig(n_turbines=50, turbine_model="V164-9.5MW",
+                      boundary_params={"width": 500, "height": 500},
+                      visualization=_no_plots)
+try:
+    generate_grid_layout(
+        tiny.create_boundary(), 50,
+        np.full(50, 164.0), 5.0, rng=np.random.default_rng(0),
+        spacing_matrix=tiny.spacing_matrix(),
+    )
+    raise AssertionError("场地不足应当报错")
+except RuntimeError as exc:
+    assert "场地无法容纳" in str(exc)
+    print(f"   ✓ 场地无法容纳时给出可操作诊断: {str(exc).splitlines()[0]}")
+
+print("\n" + "=" * 60)
 print("所有核心测试通过! ✓")
 print("=" * 60)
 print("\n可以使用以下命令运行完整分析:")
 print("  python -m wind_farm_opt --help")
 print("  python -m wind_farm_opt --n-turbines 15 --iterations 100 --population 50")
 print("  python -m wind_farm_opt --config my_config.json")
+print("\n多机型配置示例见 README，支持 fleet.turbine_types 与 fleet.turbines 两种声明。")

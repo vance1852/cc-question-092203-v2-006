@@ -7,9 +7,9 @@ import numpy as np
 
 from ..constraints.boundary import SiteBoundary
 from ..constraints.spacing import (
-    check_min_spacing,
-    compute_min_spacing_from_diameters,
+    check_pairwise_spacing,
     enforce_min_spacing,
+    pairwise_min_spacings,
 )
 
 
@@ -98,6 +98,7 @@ class GeneticAlgorithm:
         boundary: SiteBoundary,
         fitness_fn: Callable[[np.ndarray], float],
         config: Optional[GAConfig] = None,
+        spacing_matrix: Optional[np.ndarray] = None,
     ) -> None:
         """
         Parameters
@@ -112,6 +113,10 @@ class GeneticAlgorithm:
             适应度函数，输入位置数组 (N_turb, 2)，返回净AEP
         config : Optional[GAConfig]
             算法配置参数
+        spacing_matrix : Optional[np.ndarray]
+            逐对最小间距矩阵 (N, N)，每对机组按各自平均直径的倍数
+            约束；省略时由 rotor_diameters 与 min_spacing_multiple
+            现算
         """
         self.n_turbines = n_turbines
         self.rotor_diameters = np.asarray(rotor_diameters, dtype=np.float64)
@@ -121,10 +126,14 @@ class GeneticAlgorithm:
 
         self.rng = np.random.default_rng(self.config.seed)
 
-        self.min_spacing = compute_min_spacing_from_diameters(
-            self.rotor_diameters,
-            self.config.min_spacing_multiple,
-        )
+        if spacing_matrix is None:
+            spacing_matrix = pairwise_min_spacings(
+                self.rotor_diameters,
+                self.config.min_spacing_multiple,
+            )
+        self.spacing_matrix = np.asarray(spacing_matrix, dtype=np.float64)
+        # 标量值仅用于打印与初始化采样的整体尺度
+        self.min_spacing = float(np.max(self.spacing_matrix))
 
         self.n_dim = n_turbines * 2
         self.x_range = boundary.x_max - boundary.x_min
@@ -151,7 +160,7 @@ class GeneticAlgorithm:
         return population
 
     def _generate_valid_layout(self) -> np.ndarray:
-        """生成一个满足约束的初始布局。"""
+        """生成一个满足逐对间距约束的初始布局。"""
         max_attempts = 100
 
         for _ in range(max_attempts):
@@ -159,7 +168,7 @@ class GeneticAlgorithm:
                 positions = self.boundary.sample_random_points(
                     self.n_turbines, self.rng, max_attempts=50
                 )
-                valid, _ = check_min_spacing(positions, self.min_spacing)
+                valid, _ = check_pairwise_spacing(positions, self.spacing_matrix)
                 if valid:
                     return positions
             except RuntimeError:
@@ -170,16 +179,21 @@ class GeneticAlgorithm:
                     self.n_turbines, self.rng, max_attempts=50
                 )
                 positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
+                    positions, self.spacing_matrix, self.boundary, self.rng
                 )
                 return positions
             except RuntimeError:
                 continue
 
-        raise RuntimeError("无法生成满足约束的初始布局")
+        raise RuntimeError(
+            f"无法生成满足约束的初始布局：场地可能无法以 "
+            f"{self.config.min_spacing_multiple:.1f} 倍平均转子直径的间距"
+            f"容纳 {self.n_turbines} 台机组。请减小机组数量、"
+            f"降低 min_spacing_multiple，或扩大场地。"
+        )
 
     def _compute_penalty(self, positions_flat: np.ndarray) -> float:
-        """计算约束违反惩罚。"""
+        """计算约束违反惩罚（逐对间距）。"""
         positions = positions_flat.reshape(self.n_turbines, 2)
 
         penalty = 0.0
@@ -189,11 +203,12 @@ class GeneticAlgorithm:
             n_violations = np.sum(~inside)
             penalty += n_violations * self.config.penalty_factor
 
-        valid, violations = check_min_spacing(positions, self.min_spacing)
+        valid, violations = check_pairwise_spacing(positions, self.spacing_matrix)
         if not valid:
             for i, j in violations:
                 dist = np.linalg.norm(positions[i] - positions[j])
-                penalty += (self.min_spacing - dist) * self.config.penalty_factor
+                required = self.spacing_matrix[i, j]
+                penalty += (required - dist) * self.config.penalty_factor
 
         return penalty
 
@@ -255,20 +270,20 @@ class GeneticAlgorithm:
         return mutated
 
     def _repair(self, individual: np.ndarray) -> np.ndarray:
-        """修复违反约束的个体。"""
+        """修复违反约束的个体（边界投影 + 按逐对间距推开）。"""
         positions = individual.reshape(self.n_turbines, 2)
 
         for i in range(self.n_turbines):
             if not self.boundary.contains_point(positions[i]):
                 positions[i] = self.boundary.project_to_boundary(positions[i])
 
-        valid, _ = check_min_spacing(positions, self.min_spacing)
+        valid, _ = check_pairwise_spacing(positions, self.spacing_matrix)
         inside = self.boundary.contains_all(positions).all()
 
         if not (valid and inside):
             try:
                 positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
+                    positions, self.spacing_matrix, self.boundary, self.rng
                 )
             except RuntimeError:
                 pass
@@ -298,8 +313,13 @@ class GeneticAlgorithm:
             print(f"风机台数: {self.n_turbines}")
             print(f"种群大小: {pop_size}")
             print(f"最大代数: {max_gen}")
-            print(f"最小间距: {self.min_spacing:.1f} m "
-                  f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
+            if np.unique(self.rotor_diameters).size == 1:
+                print(f"最小间距: {self.min_spacing:.1f} m "
+                      f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
+            else:
+                off = self.spacing_matrix[~np.eye(self.n_turbines, dtype=bool)]
+                print(f"逐对间距: {off.min():.1f} ~ {off.max():.1f} m "
+                      f"({self.config.min_spacing_multiple:.1f}倍两机平均直径)")
             print(f"场地面积: {self.boundary.area / 1e6:.2f} km²")
             print("=" * 35)
 

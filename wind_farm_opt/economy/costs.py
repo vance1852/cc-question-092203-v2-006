@@ -100,6 +100,7 @@ class EconomicResult:
     irr: Optional[float]
     payback_period: Optional[float]
     cost_breakdown: dict[str, float]
+    model_breakdown: Optional[list[dict]] = None
 
 
 class EconomicAnalyzer:
@@ -110,20 +111,32 @@ class EconomicAnalyzer:
         turbine_cost: TurbineCostModel,
         farm_cost: FarmCostModel,
         electricity_price: float = 0.45,
+        turbine_costs: Optional[dict[str, TurbineCostModel]] = None,
     ) -> None:
         """
         Parameters
         ----------
         turbine_cost : TurbineCostModel
-            风机造价模型
+            风机造价模型（单一机型，或作为未在 turbine_costs 中
+            声明的型号的回退）
         farm_cost : FarmCostModel
             风电场造价模型
         electricity_price : float
             上网电价 (元/kWh)
+        turbine_costs : Optional[dict[str, TurbineCostModel]]
+            多机型场景下各型号的造价模型 {型号名: 造价模型}；
+            省略时仅包含 turbine_cost 对应的单一型号
         """
         self.turbine_cost = turbine_cost
         self.farm_cost = farm_cost
         self.electricity_price = electricity_price
+        if turbine_costs is None:
+            turbine_costs = {turbine_cost.turbine_model: turbine_cost}
+        self.turbine_costs = dict(turbine_costs)
+
+    def _cost_for(self, model: str) -> TurbineCostModel:
+        """返回指定型号的造价模型，未知型号回退到单一机型造价模型。"""
+        return self.turbine_costs.get(model, self.turbine_cost)
 
     def compute_capital_cost(
         self,
@@ -430,6 +443,128 @@ class EconomicAnalyzer:
             cost_breakdown=cost_breakdown,
         )
 
+    def analyze_fleet(
+        self,
+        fleet_items: list[dict],
+        net_aep_GWh: float,
+    ) -> EconomicResult:
+        """多机型机队的完整经济性分析。
+
+        各型号按自身单位容量造价、安装费、年运维费分别核算后汇总；
+        并网费按总装机容量核算，场地开发与道路建设为固定费用。
+        寿命期取各型号设计寿命的最大值，年运维费用现值则按各型号
+        自身寿命分别折现后求和。
+
+        Parameters
+        ----------
+        fleet_items : list[dict]
+            机队构成，每个元素为
+            ``{"model": 型号名, "count": 台数,
+               "rated_power_mw": 单台额定功率(MW)}``
+        net_aep_GWh : float
+            净年发电量 (GWh/year)
+
+        Returns
+        -------
+        EconomicResult
+            经济性分析结果，``model_breakdown`` 中含分型号明细
+        """
+        r = self.farm_cost.discount_rate
+        inflation = self.farm_cost.inflation_rate
+        r_real = (1 + r) / (1 + inflation) - 1
+
+        def annuity(years: float) -> float:
+            return (1 - (1 + r_real) ** (-years)) / r_real
+
+        total_capacity = 0.0
+        turbine_capital = 0.0
+        turbine_installation = 0.0
+        annual_om_cost = 0.0
+        om_cost_pv = 0.0
+        lifetimes: list[float] = []
+        model_breakdown: list[dict] = []
+
+        for item in fleet_items:
+            model = item["model"]
+            count = int(item["count"])
+            rated_mw = float(item["rated_power_mw"])
+            capacity = count * rated_mw
+            cm = self._cost_for(model)
+
+            cap = capacity * cm.capital_cost_per_MW
+            inst = capacity * cm.installation_cost_per_MW
+            om_annual = capacity * cm.o_and_m_cost_per_MW_per_year
+
+            total_capacity += capacity
+            turbine_capital += cap
+            turbine_installation += inst
+            annual_om_cost += om_annual
+            om_cost_pv += om_annual * annuity(cm.design_lifetime)
+            lifetimes.append(cm.design_lifetime)
+
+            model_breakdown.append({
+                "model": model,
+                "count": count,
+                "rated_power_mw": rated_mw,
+                "capacity_mw": float(capacity),
+                "capital_cost": float(cap),
+                "installation_cost": float(inst),
+                "annual_om_cost": float(om_annual),
+                "capital_cost_per_MW": float(cm.capital_cost_per_MW),
+                "installation_cost_per_MW": float(cm.installation_cost_per_MW),
+                "o_and_m_cost_per_MW_per_year": float(cm.o_and_m_cost_per_MW_per_year),
+                "design_lifetime": float(cm.design_lifetime),
+            })
+
+        grid_connection = total_capacity * self.farm_cost.grid_connection_cost_per_MW
+        site_dev = self.farm_cost.site_development_cost
+        access_road = self.farm_cost.access_road_cost
+
+        total_capital_cost = (
+            turbine_capital + turbine_installation
+            + grid_connection + site_dev + access_road
+        )
+        cost_breakdown = {
+            "风机设备": turbine_capital,
+            "风机安装": turbine_installation,
+            "并网工程": grid_connection,
+            "场地开发": site_dev,
+            "道路建设": access_road,
+        }
+
+        annual_revenue = self.compute_annual_revenue(net_aep_GWh)
+        farm_lifetime = max(lifetimes) if lifetimes else self.turbine_cost.design_lifetime
+
+        energy_pv = net_aep_GWh * 1e6 * annuity(farm_lifetime)
+        if energy_pv <= 0:
+            lcoe = np.inf
+        else:
+            lcoe = (total_capital_cost + om_cost_pv) * 1e4 / energy_pv
+
+        npv = self.compute_npv(
+            total_capital_cost, annual_revenue, annual_om_cost, farm_lifetime
+        )
+        irr = self.compute_irr(
+            total_capital_cost, annual_revenue, annual_om_cost, farm_lifetime
+        )
+        payback = self.compute_payback_period(
+            total_capital_cost, annual_revenue, annual_om_cost
+        )
+
+        return EconomicResult(
+            total_installed_capacity=float(total_capacity),
+            net_aep=float(net_aep_GWh),
+            annual_revenue=float(annual_revenue),
+            lcoe=float(lcoe),
+            total_capital_cost=float(total_capital_cost),
+            total_om_cost_annual=float(annual_om_cost),
+            npv=npv,
+            irr=irr,
+            payback_period=payback,
+            cost_breakdown=cost_breakdown,
+            model_breakdown=model_breakdown,
+        )
+
 
 def get_default_turbine_cost(model: str = "V164-9.5MW") -> TurbineCostModel:
     """获取默认风机造价模型。
@@ -462,6 +597,59 @@ def get_default_turbine_cost(model: str = "V164-9.5MW") -> TurbineCostModel:
         )
     else:
         raise ValueError(f"未知的风机型号: {model}")
+
+
+# 自定义机型的默认造价系数（在内置小机型水平上取保守默认值）
+DEFAULT_CUSTOM_CAPITAL_COST_PER_MW = 600.0
+DEFAULT_CUSTOM_INSTALLATION_COST_PER_MW = 75.0
+DEFAULT_CUSTOM_OM_COST_PER_MW_PER_YEAR = 16.0
+
+
+def cost_model_from_spec(
+    model: str,
+    spec: Optional[dict] = None,
+) -> TurbineCostModel:
+    """根据型号名称（及可选的自定义机型规格）构建造价模型。
+
+    自定义机型可在规格中通过 ``capital_cost_per_MW``、
+    ``installation_cost_per_MW``、``o_and_m_cost_per_MW_per_year``、
+    ``design_lifetime`` 覆盖默认造价系数；未覆盖时使用混合机型的
+    保守默认值。
+
+    Parameters
+    ----------
+    model : str
+        风机型号
+    spec : Optional[dict]
+        自定义机型规格（config 中的 catalog 条目）
+
+    Returns
+    -------
+    TurbineCostModel
+        该型号的造价模型
+    """
+    try:
+        return get_default_turbine_cost(model)
+    except ValueError:
+        pass
+
+    spec = spec or {}
+    return TurbineCostModel(
+        turbine_model=model,
+        capital_cost_per_MW=float(
+            spec.get("capital_cost_per_MW", DEFAULT_CUSTOM_CAPITAL_COST_PER_MW)
+        ),
+        installation_cost_per_MW=float(
+            spec.get("installation_cost_per_MW", DEFAULT_CUSTOM_INSTALLATION_COST_PER_MW)
+        ),
+        o_and_m_cost_per_MW_per_year=float(
+            spec.get(
+                "o_and_m_cost_per_MW_per_year",
+                DEFAULT_CUSTOM_OM_COST_PER_MW_PER_YEAR,
+            )
+        ),
+        design_lifetime=float(spec.get("design_lifetime", 25.0)),
+    )
 
 
 def get_default_farm_cost() -> FarmCostModel:

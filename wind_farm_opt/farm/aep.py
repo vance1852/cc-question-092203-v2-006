@@ -21,8 +21,14 @@ class TurbineResult:
     ----------
     turbine_idx : int
         风机索引
+    turbine_id : Optional[str]
+        机组稳定编号
     name : str
-        风机名称
+        风机名称（型号）
+    rated_power_kw : float
+        该机组的额定功率 (kW)
+    rotor_diameter : float
+        该机组的转子直径 (m)
     gross_aep : float
         理论年发电量（无尾流）(MWh/year)
     net_aep : float
@@ -50,6 +56,9 @@ class TurbineResult:
     capacity_factor: float
     avg_effective_speed: float
     dominant_wake_source: Optional[int]
+    turbine_id: Optional[str] = None
+    rated_power_kw: float = 0.0
+    rotor_diameter: float = 0.0
     total_power_loss_by_source: dict[int, float] = field(default_factory=dict)
 
 
@@ -85,6 +94,7 @@ class FarmResult:
     total_installed_capacity: float
     turbine_results: list[TurbineResult]
     sector_results: dict[int, dict]
+    model_summary: dict[str, dict] = field(default_factory=dict)
 
 
 class AEPCalculator:
@@ -129,6 +139,7 @@ class AEPCalculator:
         self._speed_centers = self._speed_bins[:-1] + 0.5 * speed_step
 
         self._turbine_names = [t.name for t in turbines]
+        self._turbine_ids = [t.turbine_id for t in turbines]
         self._rotor_diameters = np.array([t.rotor_diameter for t in turbines], dtype=np.float64)
         self._thrust_coefficients = np.array([t.thrust_coefficient for t in turbines], dtype=np.float64)
         self._rated_powers = np.array([t.rated_power for t in turbines], dtype=np.float64)
@@ -429,9 +440,14 @@ class AEPCalculator:
                 capacity_factor=float(net / (self._rated_powers[i] / 1e3 * 8760.0) * 100.0) if self._rated_powers[i] > 0 else 0.0,
                 avg_effective_speed=0.0,
                 dominant_wake_source=dominant_source,
+                turbine_id=self._turbine_ids[i],
+                rated_power_kw=float(self._rated_powers[i]),
+                rotor_diameter=float(self._rotor_diameters[i]),
                 total_power_loss_by_source=loss_sources,
             )
             turbine_results.append(turb_result)
+
+        model_summary = self._summarize_by_model(turbine_results)
 
         return FarmResult(
             gross_aep=gross_aep,
@@ -442,7 +458,32 @@ class AEPCalculator:
             total_installed_capacity=total_installed,
             turbine_results=turbine_results,
             sector_results=sector_results,
+            model_summary=model_summary,
         )
+
+    def _summarize_by_model(
+        self,
+        turbine_results: list[TurbineResult],
+    ) -> dict[str, dict]:
+        """按型号汇总机组明细（台数、容量、AEP）。"""
+        summary: dict[str, dict] = {}
+        for tr in turbine_results:
+            entry = summary.setdefault(tr.name, {
+                "count": 0,
+                "rated_power_kw": tr.rated_power_kw,
+                "rotor_diameter": tr.rotor_diameter,
+                "capacity_mw": 0.0,
+                "gross_aep_mwh": 0.0,
+                "net_aep_mwh": 0.0,
+                "turbine_ids": [],
+            })
+            entry["count"] += 1
+            entry["capacity_mw"] += tr.rated_power_kw / 1e3
+            entry["gross_aep_mwh"] += tr.gross_aep
+            entry["net_aep_mwh"] += tr.net_aep
+            if tr.turbine_id is not None:
+                entry["turbine_ids"].append(tr.turbine_id)
+        return summary
 
     def evaluate_layout(
         self,

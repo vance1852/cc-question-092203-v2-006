@@ -51,6 +51,10 @@ class TurbineResult:
     avg_effective_speed: float
     dominant_wake_source: Optional[int]
     total_power_loss_by_source: dict[int, float] = field(default_factory=dict)
+    turbine_id: Optional[str] = None
+    """机组稳定编号（多机型机队中唯一）。"""
+    rated_power_mw: float = 0.0
+    """该机组额定容量 (MW)。"""
 
 
 @dataclass
@@ -85,6 +89,8 @@ class FarmResult:
     total_installed_capacity: float
     turbine_results: list[TurbineResult]
     sector_results: dict[int, dict]
+    model_summary: dict[str, dict] = field(default_factory=dict)
+    """按型号汇总的台数、装机容量(MW)、毛/净发电量(GWh)。"""
 
 
 class AEPCalculator:
@@ -129,6 +135,7 @@ class AEPCalculator:
         self._speed_centers = self._speed_bins[:-1] + 0.5 * speed_step
 
         self._turbine_names = [t.name for t in turbines]
+        self._turbine_ids = [getattr(t, "turbine_id", None) for t in turbines]
         self._rotor_diameters = np.array([t.rotor_diameter for t in turbines], dtype=np.float64)
         self._thrust_coefficients = np.array([t.thrust_coefficient for t in turbines], dtype=np.float64)
         self._rated_powers = np.array([t.rated_power for t in turbines], dtype=np.float64)
@@ -430,8 +437,23 @@ class AEPCalculator:
                 avg_effective_speed=0.0,
                 dominant_wake_source=dominant_source,
                 total_power_loss_by_source=loss_sources,
+                turbine_id=self._turbine_ids[i],
+                rated_power_mw=float(self._rated_powers[i] / 1e3),
             )
             turbine_results.append(turb_result)
+
+        model_summary: dict[str, dict] = {}
+        for tr in turbine_results:
+            item = model_summary.setdefault(
+                tr.name,
+                {"count": 0, "capacity_mw": 0.0, "gross_aep_gwh": 0.0,
+                 "net_aep_gwh": 0.0, "wake_loss_gwh": 0.0},
+            )
+            item["count"] += 1
+            item["capacity_mw"] += tr.rated_power_mw
+            item["gross_aep_gwh"] += tr.gross_aep / 1e3
+            item["net_aep_gwh"] += tr.net_aep / 1e3
+            item["wake_loss_gwh"] += tr.wake_loss / 1e3
 
         return FarmResult(
             gross_aep=gross_aep,
@@ -442,6 +464,7 @@ class AEPCalculator:
             total_installed_capacity=total_installed,
             turbine_results=turbine_results,
             sector_results=sector_results,
+            model_summary=model_summary,
         )
 
     def evaluate_layout(

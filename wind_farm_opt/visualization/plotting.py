@@ -36,6 +36,13 @@ def set_chinese_font() -> None:
     plt.rcParams["axes.unicode_minus"] = False
 
 
+def _model_color_map(model_names: list[str]) -> dict[str, tuple]:
+    """为出现的型号分配稳定颜色。"""
+    unique = list(dict.fromkeys(model_names))
+    palette = plt.get_cmap("tab10")
+    return {name: palette(i % 10) for i, name in enumerate(unique)}
+
+
 def plot_farm_layout(
     positions: np.ndarray,
     boundary: SiteBoundary,
@@ -43,6 +50,8 @@ def plot_farm_layout(
     turbine_losses: Optional[np.ndarray] = None,
     turbine_names: Optional[list[str]] = None,
     wake_interactions: Optional[dict] = None,
+    turbine_models: Optional[list[str]] = None,
+    model_summary: Optional[dict[str, dict]] = None,
     title: str = "风电场机位布局",
     save_path: Optional[str] = None,
     show: bool = False,
@@ -60,9 +69,13 @@ def plot_farm_layout(
     turbine_losses : Optional[np.ndarray]
         每台风机的尾流损失百分比 (N,)，用于着色
     turbine_names : Optional[list[str]]
-        风机名称/编号
+        风机名称/编号（建议传稳定编号）
     wake_interactions : Optional[dict]
         尾流相互作用信息，用于绘制尾流连线
+    turbine_models : Optional[list[str]]
+        每台机组的型号名 (N,)；提供后不同型号使用不同描边色并附图例
+    model_summary : Optional[dict[str, dict]]
+        按型号汇总的台数与容量，在图上以文本框展示
     title : str
         图表标题
     save_path : Optional[str]
@@ -84,13 +97,23 @@ def plot_farm_layout(
     )
     ax.add_patch(poly)
 
+    model_colors = (
+        _model_color_map(turbine_models) if turbine_models is not None else None
+    )
+
+    def edge_color(i: int):
+        if model_colors is None:
+            return "black" if turbine_losses is not None else "darkblue"
+        return model_colors[turbine_models[i]]
+
     if turbine_losses is not None:
         norm = Normalize(vmin=0, vmax=max(30.0, np.max(turbine_losses)))
         cmap = plt.get_cmap("YlOrRd")
 
         for i, (pos, d, loss) in enumerate(zip(positions, rotor_diameters, turbine_losses)):
             color = cmap(norm(loss))
-            circle = Circle(pos, d / 2.0, facecolor=color, edgecolor="black", linewidth=1.5, alpha=0.8)
+            circle = Circle(pos, d / 2.0, facecolor=color, edgecolor=edge_color(i),
+                            linewidth=2.5 if model_colors else 1.5, alpha=0.85)
             ax.add_patch(circle)
 
             if turbine_names is not None:
@@ -100,7 +123,7 @@ def plot_farm_layout(
                     turbine_names[i],
                     ha="center",
                     va="center",
-                    fontsize=9,
+                    fontsize=8,
                     fontweight="bold",
                 )
 
@@ -109,8 +132,14 @@ def plot_farm_layout(
         cbar = fig.colorbar(sm, ax=ax, fraction=0.046, pad=0.04)
         cbar.set_label("尾流损失 (%)")
     else:
+        face_by_model = model_colors is not None
         for i, (pos, d) in enumerate(zip(positions, rotor_diameters)):
-            circle = Circle(pos, d / 2.0, facecolor="steelblue", edgecolor="darkblue", linewidth=1.5, alpha=0.7)
+            facecolor = (
+                model_colors[turbine_models[i]] if face_by_model else "steelblue"
+            )
+            circle = Circle(pos, d / 2.0, facecolor=facecolor,
+                            edgecolor="black" if face_by_model else "darkblue",
+                            linewidth=1.5 if face_by_model else 1.5, alpha=0.7)
             ax.add_patch(circle)
 
             if turbine_names is not None:
@@ -120,10 +149,47 @@ def plot_farm_layout(
                     turbine_names[i],
                     ha="center",
                     va="center",
-                    fontsize=9,
+                    fontsize=8,
                     color="white",
                     fontweight="bold",
                 )
+
+    # 型号图例（描边色/填充色随是否显示损失而不同）。
+    if model_colors is not None:
+        legend_handles = [
+            plt.Line2D(
+                [0], [0], marker="o", linestyle="none", markersize=9,
+                markerfacecolor=(
+                    color if turbine_losses is None else "white"
+                ),
+                markeredgecolor=color,
+                markeredgewidth=2.0,
+                label=(
+                    f"{name}"
+                    if model_summary is None
+                    else f"{name} ×{model_summary[name]['count']}"
+                ),
+            )
+            for name, color in model_colors.items()
+        ]
+        ax.legend(
+            handles=legend_handles, loc="upper right", title="机组型号",
+            fontsize=9,
+        )
+    else:
+        ax.legend(loc="upper right")
+
+    if model_summary:
+        lines = ["机型 / 台数 / 容量"]
+        for name, info in model_summary.items():
+            lines.append(
+                f"{name}: {int(info['count'])} 台, {info['capacity_mw']:.2f} MW"
+            )
+        ax.text(
+            0.01, 0.01, "\n".join(lines), transform=ax.transAxes,
+            va="bottom", ha="left", fontsize=8,
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+        )
 
     if wake_interactions is not None:
         for (up_idx, down_idx), intensity in wake_interactions.items():
@@ -152,7 +218,6 @@ def plot_farm_layout(
     ax.set_ylabel("Y 坐标 (m)")
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.grid(True, alpha=0.3)
-    ax.legend(loc="upper right")
 
     plt.tight_layout()
 
@@ -451,8 +516,11 @@ def plot_turbine_loss_bar(
     indices = np.arange(n_turb)
     loss_pcts = [tr.wake_loss_pct for tr in farm_result.turbine_results]
     net_aeps = [tr.net_aep for tr in farm_result.turbine_results]
+    model_names = [tr.name for tr in farm_result.turbine_results]
+    model_colors = _model_color_map(model_names)
+    bar_colors = [model_colors[name] for name in model_names]
 
-    bars = ax.bar(indices, loss_pcts, color="salmon", edgecolor="darkred", alpha=0.8)
+    bars = ax.bar(indices, loss_pcts, color=bar_colors, edgecolor="darkred", alpha=0.8)
 
     for i, (bar, loss) in enumerate(zip(bars, loss_pcts)):
         height = bar.get_height()
@@ -460,14 +528,16 @@ def plot_turbine_loss_bar(
         dom_source = tr.dominant_wake_source
         label = f"{loss:.1f}%"
         if dom_source is not None:
-            label += f"\n(#{dom_source})"
+            source = farm_result.turbine_results[dom_source]
+            source_label = source.turbine_id or f"#{dom_source}"
+            label += f"\n({source_label})"
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
             height + 0.3,
             label,
             ha="center",
             va="bottom",
-            fontsize=8,
+            fontsize=7,
         )
 
     avg_loss = np.mean(loss_pcts)
@@ -479,13 +549,23 @@ def plot_turbine_loss_bar(
         label=f"平均损失: {avg_loss:.1f}%",
     )
 
-    ax.set_xlabel("风机编号")
+    ax.set_xlabel("机组编号")
     ax.set_ylabel("尾流损失 (%)")
     ax.set_title(title, fontsize=14, fontweight="bold")
     ax.set_xticks(indices)
-    ax.set_xticklabels([f"#{i}" for i in indices], fontsize=8)
+    xtick_labels = [
+        (tr.turbine_id or f"#{i}") for i, tr in enumerate(farm_result.turbine_results)
+    ]
+    ax.set_xticklabels(xtick_labels, fontsize=7, rotation=45, ha="right")
     ax.grid(True, alpha=0.3, axis="y")
-    ax.legend(loc="upper right")
+
+    model_handles = [
+        plt.Line2D([0], [0], marker="s", linestyle="none", markersize=10,
+                   markerfacecolor=color, markeredgecolor="darkred",
+                   label=name)
+        for name, color in model_colors.items()
+    ]
+    ax.legend(handles=model_handles, loc="upper right", title="机组型号", fontsize=9)
 
     plt.tight_layout()
 

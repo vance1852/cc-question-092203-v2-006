@@ -32,6 +32,9 @@ class Turbine:
         额定功率 (kW)，从功率曲线自动推断
     position : Optional[Tuple[float, float]]
         风机位置 (x, y) (m)，可选
+    turbine_id : Optional[str]
+        机组稳定编号（机队内唯一），用于在多机型扩建场景中标识机组身份；
+        为 None 时退化为仅按型号与索引识别（等价于旧的单一机型行为）
     """
 
     name: str
@@ -40,6 +43,7 @@ class Turbine:
     thrust_coefficient: float
     power_curve: np.ndarray
     position: Optional[Tuple[float, float]] = None
+    turbine_id: Optional[str] = None
 
     cut_in_speed: float = field(init=False)
     rated_speed: float = field(init=False)
@@ -98,6 +102,123 @@ class Turbine:
     def rotor_area(self) -> float:
         """风轮扫掠面积 (m^2)。"""
         return np.pi * (self.rotor_diameter / 2.0) ** 2
+
+
+def clone_turbine(turbine: Turbine, turbine_id: Optional[str] = None) -> Turbine:
+    """创建一个风机模板的独立实例。
+
+    与直接复用同一 ``Turbine`` 对象不同，克隆得到的每台机组拥有独立的
+    功率曲线数组与位置/编号，可在混合机型机队中分别设置机位。
+
+    Parameters
+    ----------
+    turbine : Turbine
+        风机模板
+    turbine_id : Optional[str]
+        新机组的稳定编号
+
+    Returns
+    -------
+    Turbine
+        与模板参数相同但相互独立的风机实例
+    """
+    return Turbine(
+        name=turbine.name,
+        hub_height=turbine.hub_height,
+        rotor_diameter=turbine.rotor_diameter,
+        thrust_coefficient=turbine.thrust_coefficient,
+        power_curve=np.array(turbine.power_curve, dtype=np.float64, copy=True),
+        position=turbine.position,
+        turbine_id=turbine_id,
+    )
+
+
+def create_turbine_from_spec(
+    name: str,
+    hub_height: float,
+    rotor_diameter: float,
+    thrust_coefficient: float,
+    rated_power_kw: float | None = None,
+    cut_in_speed: float | None = None,
+    rated_wind_speed: float | None = None,
+    cut_out_speed: float | None = None,
+    power_curve: np.ndarray | None = None,
+    turbine_id: Optional[str] = None,
+) -> Turbine:
+    """根据参数创建风机实例。
+
+    若直接提供 ``power_curve`` 则按给定曲线构造；否则用额定功率与
+    切入/额定/切出风速合成三段式（切入至额定按三次方增长）功率曲线。
+
+    Parameters
+    ----------
+    name : str
+        型号名称
+    hub_height : float
+        轮毂高度 (m)
+    rotor_diameter : float
+        转子直径 (m)
+    thrust_coefficient : float
+        推力系数
+    rated_power_kw : float
+        额定功率 (kW)，合成曲线时使用
+    cut_in_speed : float
+        切入风速 (m/s)
+    rated_wind_speed : float
+        额定风速 (m/s)
+    cut_out_speed : float
+        切出风速 (m/s)
+    power_curve : np.ndarray
+        显式功率曲线 (N, 2)，给出时优先使用
+    turbine_id : Optional[str]
+        机组稳定编号
+
+    Returns
+    -------
+    Turbine
+        风机实例
+    """
+    if power_curve is not None:
+        return Turbine(
+            name=name,
+            hub_height=hub_height,
+            rotor_diameter=rotor_diameter,
+            thrust_coefficient=thrust_coefficient,
+            power_curve=power_curve,
+            turbine_id=turbine_id,
+        )
+
+    if rated_power_kw is None or cut_in_speed is None or rated_wind_speed is None or cut_out_speed is None:
+        raise ValueError(
+            f"机型 {name}: 未提供 power_curve 时，必须同时给出额定功率与"
+            "切入/额定/切出风速以合成功率曲线"
+        )
+    if not cut_in_speed < rated_wind_speed <= cut_out_speed:
+        raise ValueError(
+            f"机型 {name}: 风速参数需满足 切入 < 额定 <= 切出，"
+            f"当前为 {cut_in_speed}/{rated_wind_speed}/{cut_out_speed}"
+        )
+
+    speeds = np.arange(0.0, cut_out_speed + 1.0, 1.0)
+    powers = np.zeros_like(speeds)
+    for i, ws in enumerate(speeds):
+        if ws < cut_in_speed or ws > cut_out_speed:
+            powers[i] = 0.0
+        elif ws <= rated_wind_speed:
+            powers[i] = rated_power_kw * (
+                (ws - cut_in_speed) / (rated_wind_speed - cut_in_speed)
+            ) ** 3
+        else:
+            powers[i] = rated_power_kw
+
+    return Turbine(
+        name=name,
+        hub_height=hub_height,
+        rotor_diameter=rotor_diameter,
+        thrust_coefficient=thrust_coefficient,
+        power_curve=np.column_stack([speeds, powers]),
+        turbine_id=turbine_id,
+    )
 
 
 def create_default_turbine(model: str = "V164-9.5MW") -> Turbine:

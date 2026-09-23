@@ -7,9 +7,9 @@ import numpy as np
 
 from ..constraints.boundary import SiteBoundary
 from ..constraints.spacing import (
-    check_min_spacing,
-    compute_min_spacing_from_diameters,
-    enforce_min_spacing,
+    check_min_spacing_pairwise,
+    compute_pairwise_min_spacings,
+    enforce_min_spacing_pairwise,
 )
 
 
@@ -69,10 +69,12 @@ class ParticleSwarmOptimizer:
 
         self.rng = np.random.default_rng(self.config.seed)
 
-        self.min_spacing = compute_min_spacing_from_diameters(
+        # 成对间距：要求 = 倍数 × (D_i + D_j)/2，同型号时退化为倍数 × D。
+        self.min_spacing_matrix = compute_pairwise_min_spacings(
             self.rotor_diameters,
             self.config.min_spacing_multiple,
         )
+        self.min_spacing = float(np.max(self.min_spacing_matrix))
 
         self.n_dim = n_turbines * 2
         self.x_range = boundary.x_max - boundary.x_min
@@ -121,7 +123,7 @@ class ParticleSwarmOptimizer:
                 positions = self.boundary.sample_random_points(
                     self.n_turbines, self.rng, max_attempts=50
                 )
-                valid, _ = check_min_spacing(positions, self.min_spacing)
+                valid, _ = check_min_spacing_pairwise(positions, self.min_spacing_matrix)
                 if valid:
                     return positions
             except RuntimeError:
@@ -131,14 +133,17 @@ class ParticleSwarmOptimizer:
                 positions = self.boundary.sample_random_points(
                     self.n_turbines, self.rng, max_attempts=50
                 )
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
+                positions = enforce_min_spacing_pairwise(
+                    positions, self.min_spacing_matrix, self.boundary, self.rng
                 )
                 return positions
             except RuntimeError:
                 continue
 
-        raise RuntimeError("无法生成满足约束的初始布局")
+        raise RuntimeError(
+            "无法生成满足成对间距约束的初始布局：场地可能无法容纳全部机组，"
+            "请减少机组数量、降低 min_spacing_multiple 或扩大场地。"
+        )
 
     def _compute_penalty(self, positions_flat: np.ndarray) -> float:
         """计算约束违反惩罚。"""
@@ -151,11 +156,13 @@ class ParticleSwarmOptimizer:
             n_violations = np.sum(~inside)
             penalty += n_violations * self.config.penalty_factor
 
-        valid, violations = check_min_spacing(positions, self.min_spacing)
+        valid, violations = check_min_spacing_pairwise(positions, self.min_spacing_matrix)
         if not valid:
             for i, j in violations:
                 dist = np.linalg.norm(positions[i] - positions[j])
-                penalty += (self.min_spacing - dist) * self.config.penalty_factor
+                penalty += (
+                    self.min_spacing_matrix[i, j] - dist
+                ) * self.config.penalty_factor
 
         return penalty
 
@@ -186,13 +193,13 @@ class ParticleSwarmOptimizer:
             if not self.boundary.contains_point(positions[i]):
                 positions[i] = self.boundary.project_to_boundary(positions[i])
 
-        valid, _ = check_min_spacing(positions, self.min_spacing)
+        valid, _ = check_min_spacing_pairwise(positions, self.min_spacing_matrix)
         inside = self.boundary.contains_all(positions).all()
 
         if not (valid and inside):
             try:
-                positions = enforce_min_spacing(
-                    positions, self.min_spacing, self.boundary, self.rng
+                positions = enforce_min_spacing_pairwise(
+                    positions, self.min_spacing_matrix, self.boundary, self.rng
                 )
             except RuntimeError:
                 pass
@@ -221,8 +228,20 @@ class ParticleSwarmOptimizer:
             print(f"风机台数: {self.n_turbines}")
             print(f"粒子群大小: {swarm_size}")
             print(f"最大迭代: {max_iter}")
-            print(f"最小间距: {self.min_spacing:.1f} m "
-                  f"({self.config.min_spacing_multiple:.1f}倍转子直径)")
+            unique_d = np.unique(np.round(self.rotor_diameters, 6))
+            if len(unique_d) == 1:
+                spacing_text = (
+                    f"最小间距: {self.min_spacing:.1f} m "
+                    f"({self.config.min_spacing_multiple:.1f}倍转子直径)"
+                )
+            else:
+                positive = self.min_spacing_matrix[self.min_spacing_matrix > 0]
+                spacing_text = (
+                    f"成对间距: {positive.min():.1f}~{positive.max():.1f} m "
+                    f"({self.config.min_spacing_multiple:.1f}倍机对平均直径，"
+                    f"{len(unique_d)}种直径)"
+                )
+            print(spacing_text)
             print(f"w={w}, c1={c1}, c2={c2}")
             print("=" * 35)
 

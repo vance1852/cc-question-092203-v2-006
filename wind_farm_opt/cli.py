@@ -12,20 +12,23 @@ from typing import Optional
 
 import numpy as np
 
-from .config import WindFarmConfig, create_sample_config
+from .config import (
+    WindFarmConfig,
+    ConfigError,
+    create_sample_config,
+    count_fleet_units,
+)
 from .core.turbine import Turbine
 from .core.wind_resource import WindResource
 from .core.wake import WakeModel
 from .constraints.boundary import SiteBoundary
+from .constraints.spacing import compute_pairwise_min_spacings
 from .farm.aep import AEPCalculator, FarmResult
-from .optimization.baseline import generate_grid_layout
+from .optimization.baseline import generate_grid_layout, SiteCapacityError
 from .optimization.ga import GeneticAlgorithm, GAConfig
 from .optimization.pso import ParticleSwarmOptimizer, PSOConfig
 from .economy.costs import (
-    EconomicAnalyzer,
     EconomicResult,
-    get_default_turbine_cost,
-    get_default_farm_cost,
 )
 from .visualization.plotting import (
     plot_farm_layout,
@@ -53,6 +56,14 @@ class WindFarmOptimizerCLI:
         self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
         self.rated_powers = np.array([t.rated_power for t in self.turbines])
         self.thrust_coefficients = np.array([t.thrust_coefficient for t in self.turbines])
+        self.turbine_ids = [t.turbine_id or f"#{i}" for i, t in enumerate(self.turbines)]
+        self.turbine_models = [t.name for t in self.turbines]
+        self.rated_powers_MW = self.rated_powers / 1e3
+        self.cost_models = config.create_cost_models()
+        self.min_spacing_matrix = compute_pairwise_min_spacings(
+            self.rotor_diameters,
+            config.optimization.min_spacing_multiple,
+        )
 
         self.aep_calc = AEPCalculator(
             turbines=self.turbines,
@@ -91,25 +102,58 @@ class WindFarmOptimizerCLI:
         print(f"  容量系数:    {result.capacity_factor:.2f}%")
         print(f"  风机台数:    {len(result.turbine_results)}")
 
+        if result.model_summary:
+            print(f"  型号明细:")
+            for name, info in result.model_summary.items():
+                print(
+                    f"    {name}: {int(info['count'])} 台, "
+                    f"{info['capacity_mw']:.2f} MW, "
+                    f"净AEP {info['net_aep_gwh']:.2f} GWh/年"
+                )
+
         max_loss_turb = max(result.turbine_results, key=lambda x: x.wake_loss_pct)
-        print(f"  最大损失风机: #{max_loss_turb.turbine_idx} ({max_loss_turb.wake_loss_pct:.2f}%)")
+        print(
+            f"  最大损失机组: {max_loss_turb.turbine_id or '#' + str(max_loss_turb.turbine_idx)}"
+            f" ({max_loss_turb.name}, {max_loss_turb.wake_loss_pct:.2f}%)"
+        )
         if max_loss_turb.dominant_wake_source is not None:
-            print(f"    主要影响源: #{max_loss_turb.dominant_wake_source}")
+            source = result.turbine_results[max_loss_turb.dominant_wake_source]
+            print(f"    主要影响源: {source.turbine_id or '#' + str(source.turbine_idx)}")
 
     def run_baseline(self) -> None:
-        """运行基线（规则网格布局）评估。"""
-        self._print_header("步骤 1/6: 生成并评估基线网格布局")
+        """运行基线（规则网格布局或逐机清单预设机位）评估。"""
+        self._print_header("步骤 1/6: 生成并评估基线布局")
 
         rng = np.random.default_rng(self.config.optimization.seed)
-        self.baseline_positions = generate_grid_layout(
-            boundary=self.boundary,
-            n_turbines=self.config.n_turbines,
-            rotor_diameters=self.rotor_diameters,
-            min_multiple=self.config.optimization.min_spacing_multiple,
-            rng=rng,
-        )
+        n_turbines = len(self.turbines)
 
-        print(f"已生成 {self.config.n_turbines} 台风机的网格布局")
+        manifest_positions = None
+        if self.config.turbine_fleet:
+            try:
+                manifest_positions = self.config.fleet_positions()
+                if manifest_positions is not None:
+                    manifest_positions = self.config.validate_manifest_positions(
+                        self.boundary
+                    )
+            except ConfigError as exc:
+                raise ConfigError(f"逐机清单机位校验失败: {exc}") from exc
+
+        if manifest_positions is not None:
+            self.baseline_positions = manifest_positions
+            print(f"已从逐机清单载入 {n_turbines} 台机组的预设机位")
+        else:
+            try:
+                self.baseline_positions = generate_grid_layout(
+                    boundary=self.boundary,
+                    n_turbines=n_turbines,
+                    rotor_diameters=self.rotor_diameters,
+                    min_multiple=self.config.optimization.min_spacing_multiple,
+                    rng=rng,
+                )
+            except SiteCapacityError as exc:
+                raise SiteCapacityError(f"基线布局生成失败: {exc}") from exc
+
+            print(f"已生成 {n_turbines} 台机组的网格布局")
 
         self.baseline_result = self.aep_calc.compute_farm_aep(self.baseline_positions)
         self._print_result_summary(self.baseline_result, "基线布局")
@@ -121,6 +165,7 @@ class WindFarmOptimizerCLI:
         fit_fn = self.aep_calc.evaluate_layout
 
         algo = self.config.optimization.algorithm.lower()
+        n_turbines = len(self.turbines)
 
         if algo == "ga":
             ga_config = GAConfig(
@@ -130,7 +175,7 @@ class WindFarmOptimizerCLI:
                 seed=self.config.optimization.seed,
             )
             optimizer = GeneticAlgorithm(
-                n_turbines=self.config.n_turbines,
+                n_turbines=n_turbines,
                 rotor_diameters=self.rotor_diameters,
                 boundary=self.boundary,
                 fitness_fn=fit_fn,
@@ -144,7 +189,7 @@ class WindFarmOptimizerCLI:
                 seed=self.config.optimization.seed,
             )
             optimizer = ParticleSwarmOptimizer(
-                n_turbines=self.config.n_turbines,
+                n_turbines=n_turbines,
                 rotor_diameters=self.rotor_diameters,
                 boundary=self.boundary,
                 fitness_fn=fit_fn,
@@ -163,15 +208,19 @@ class WindFarmOptimizerCLI:
         self._print_result_summary(self.optimized_result, "优化后布局")
 
         if self.baseline_result is not None:
+            base_net = self.baseline_result.net_aep
             improvement = (
-                (self.optimized_result.net_aep - self.baseline_result.net_aep)
-                / self.baseline_result.net_aep
+                (self.optimized_result.net_aep - base_net)
+                / base_net
                 * 100
+                if base_net > 0 else 0.0
             )
+            base_loss_pct = self.baseline_result.wake_loss_pct
             loss_reduction = (
-                (self.baseline_result.wake_loss_pct - self.optimized_result.wake_loss_pct)
-                / self.baseline_result.wake_loss_pct
+                (base_loss_pct - self.optimized_result.wake_loss_pct)
+                / base_loss_pct
                 * 100
+                if base_loss_pct > 0 else 0.0
             )
             print(f"\n--- 优化提升 ---")
             print(f"  发电量提升:   {improvement:+.2f}%")
@@ -191,21 +240,23 @@ class WindFarmOptimizerCLI:
         else:
             result = self.optimized_result
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        from .economy.costs import EconomicAnalyzer, get_default_farm_cost
+
+        primary_cost = self.cost_models[self.turbine_models[0]]
         farm_cost = get_default_farm_cost()
         farm_cost.discount_rate = self.config.economic.discount_rate
 
         analyzer = EconomicAnalyzer(
-            turbine_cost=turbine_cost,
+            turbine_cost=primary_cost,
             farm_cost=farm_cost,
             electricity_price=self.config.economic.electricity_price,
         )
 
-        rated_power_MW = self.turbines[0].rated_power / 1e3
-        self.economic_result = analyzer.analyze(
-            n_turbines=self.config.n_turbines,
-            rated_power_per_turbine_MW=rated_power_MW,
+        self.economic_result = analyzer.analyze_fleet(
+            rated_powers_MW=self.rated_powers_MW,
             net_aep_GWh=result.net_aep / 1e3,
+            cost_models=self.cost_models,
+            model_names=self.turbine_models,
         )
 
         print(f"\n--- 经济性分析结果（基于优化后布局） ---")
@@ -215,6 +266,14 @@ class WindFarmOptimizerCLI:
         print(f"  年运维费用:    {self.economic_result.total_om_cost_annual:.1f} 万元/年")
         print(f"  年发电收益:    {self.economic_result.annual_revenue:.1f} 万元/年")
         print(f"  度电成本:      {self.economic_result.lcoe:.3f} 元/kWh")
+
+        if len(self.economic_result.model_breakdown) > 1:
+            print(f"  分型号投资明细:")
+            for name, info in self.economic_result.model_breakdown.items():
+                print(
+                    f"    {name}: {info['count']} 台 / {info['capacity_mw']:.2f} MW, "
+                    f"设备+安装 {(info['capital_cost'] + info['installation_cost']):.0f} 万元"
+                )
 
         if self.economic_result.npv is not None:
             print(f"  净现值(NPV):   {self.economic_result.npv/1e4:+.2f} 亿元")
@@ -229,11 +288,18 @@ class WindFarmOptimizerCLI:
             print(f"    {item}: {cost/1e4:.2f} 亿元 ({pct:.1f}%)")
 
     def run_turbine_sweep(self, min_turbines: int = 5, max_turbines: int = 25, step: int = 2) -> None:
-        """运行风机台数扫描分析。"""
+        """运行风机台数扫描分析。
+
+        多机型机队按清单中的型号构成循环取机，使扫描各点尽量保持
+        与全场相同的型号比例。
+        """
+        from .core.turbine import clone_turbine
+        from .economy.costs import EconomicAnalyzer, get_default_farm_cost
+
         self._print_header("步骤 4/6: 风机台数扫描分析")
 
         print(f"扫描范围: {min_turbines} ~ {max_turbines} 台，步长 {step}")
-        print("此分析将为不同台数快速优化布局并评估经济性")
+        print("此分析将为不同台数快速生成基线布局并评估经济性")
 
         sweep_data = {
             "n_turbines": [],
@@ -242,58 +308,78 @@ class WindFarmOptimizerCLI:
         }
 
         rng = np.random.default_rng(self.config.optimization.seed)
-        original_n = self.config.n_turbines
 
-        turbine_cost = get_default_turbine_cost(self.config.turbine_model)
+        base_templates = self.turbines
+        base_models = [t.name for t in base_templates]
+        cost_models = self.cost_models
+
         farm_cost = get_default_farm_cost()
         analyzer = EconomicAnalyzer(
-            turbine_cost=turbine_cost,
+            turbine_cost=cost_models[base_models[0]],
             farm_cost=farm_cost,
             electricity_price=self.config.economic.electricity_price,
         )
 
-        for n in range(min_turbines, max_turbines + 1, step):
-            print(f"\n  分析 {n} 台风机...")
-            self.config.n_turbines = n
-            self.turbines = [self.turbines[0] for _ in range(n)]
-            self.rotor_diameters = np.array([t.rotor_diameter for t in self.turbines])
-            self.rated_powers = np.array([t.rated_power for t in self.turbines])
+        saved_state = (
+            self.turbines, self.rotor_diameters, self.rated_powers,
+            self.thrust_coefficients, self.turbine_models, self.aep_calc,
+        )
 
-            self.aep_calc = AEPCalculator(
-                turbines=self.turbines,
-                wind_resource=self.wind_resource,
-                wake_model=self.wake_model,
-                wake_superposition=self.config.superposition_method,
-            )
+        try:
+            for n in range(min_turbines, max_turbines + 1, step):
+                print(f"\n  分析 {n} 台机组...")
+                turbines = [
+                    clone_turbine(base_templates[k % len(base_templates)],
+                                  turbine_id=f"WTG-{k + 1:03d}")
+                    for k in range(n)
+                ]
+                models = [base_models[k % len(base_models)] for k in range(n)]
+                diameters = np.array([t.rotor_diameter for t in turbines])
+                powers_mw = np.array([t.rated_power for t in turbines]) / 1e3
 
-            try:
-                positions = generate_grid_layout(
-                    boundary=self.boundary,
-                    n_turbines=n,
-                    rotor_diameters=self.rotor_diameters,
-                    min_multiple=self.config.optimization.min_spacing_multiple,
-                    rng=rng,
-                )
+                self.turbines = turbines
+                self.rotor_diameters = diameters
+                self.rated_powers = np.array([t.rated_power for t in turbines])
 
-                result = self.aep_calc.compute_farm_aep(positions)
+                try:
+                    self.aep_calc = AEPCalculator(
+                        turbines=turbines,
+                        wind_resource=self.wind_resource,
+                        wake_model=self.wake_model,
+                        wake_superposition=self.config.superposition_method,
+                    )
 
-                rated_power_MW = self.turbines[0].rated_power / 1e3
-                econ_result = analyzer.analyze(
-                    n_turbines=n,
-                    rated_power_per_turbine_MW=rated_power_MW,
-                    net_aep_GWh=result.net_aep / 1e3,
-                )
+                    positions = generate_grid_layout(
+                        boundary=self.boundary,
+                        n_turbines=n,
+                        rotor_diameters=diameters,
+                        min_multiple=self.config.optimization.min_spacing_multiple,
+                        rng=rng,
+                    )
 
-                sweep_data["n_turbines"].append(n)
-                sweep_data["aep"].append(result.net_aep)
-                sweep_data["lcoe"].append(econ_result.lcoe)
+                    result = self.aep_calc.compute_farm_aep(positions)
 
-                print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
-            except Exception as e:
-                print(f"    跳过: {e}")
+                    econ_result = analyzer.analyze_fleet(
+                        rated_powers_MW=powers_mw,
+                        net_aep_GWh=result.net_aep / 1e3,
+                        cost_models=cost_models,
+                        model_names=models,
+                    )
+
+                    sweep_data["n_turbines"].append(n)
+                    sweep_data["aep"].append(result.net_aep)
+                    sweep_data["lcoe"].append(econ_result.lcoe)
+
+                    print(f"    净AEP: {result.net_aep/1e3:.1f} GWh, LCOE: {econ_result.lcoe:.3f} 元/kWh")
+                except Exception as e:
+                    print(f"    跳过: {e}")
+        finally:
+            (
+                self.turbines, self.rotor_diameters, self.rated_powers,
+                self.thrust_coefficients, self.turbine_models, self.aep_calc,
+            ) = saved_state
 
         self.sweep_results = sweep_data
-        self.config.n_turbines = original_n
 
     def run_visualization(self) -> None:
         """生成所有可视化图表。"""
@@ -320,15 +406,17 @@ class WindFarmOptimizerCLI:
                 boundary=self.boundary,
                 rotor_diameters=self.rotor_diameters,
                 turbine_losses=baseline_losses,
-                turbine_names=[f"#{i}" for i in range(len(self.baseline_positions))],
-                title="基线网格布局 - 尾流损失分布",
+                turbine_names=self.turbine_ids,
+                turbine_models=self.turbine_models,
+                model_summary=self.baseline_result.model_summary,
+                title="基线布局 - 尾流损失分布",
                 save_path=os.path.join(save_dir, "baseline_layout.png") if save else None,
                 show=show,
             )
 
             plot_turbine_loss_bar(
                 farm_result=self.baseline_result,
-                title="基线布局 - 各风机尾流损失",
+                title="基线布局 - 各机组尾流损失",
                 save_path=os.path.join(save_dir, "baseline_losses.png") if save else None,
                 show=show,
             )
@@ -340,7 +428,9 @@ class WindFarmOptimizerCLI:
                 boundary=self.boundary,
                 rotor_diameters=self.rotor_diameters,
                 turbine_losses=opt_losses,
-                turbine_names=[f"#{i}" for i in range(len(self.optimized_positions))],
+                turbine_names=self.turbine_ids,
+                turbine_models=self.turbine_models,
+                model_summary=self.optimized_result.model_summary,
                 title="优化后布局 - 尾流损失分布",
                 save_path=os.path.join(save_dir, "optimized_layout.png") if save else None,
                 show=show,
@@ -348,7 +438,7 @@ class WindFarmOptimizerCLI:
 
             plot_turbine_loss_bar(
                 farm_result=self.optimized_result,
-                title="优化后布局 - 各风机尾流损失",
+                title="优化后布局 - 各机组尾流损失",
                 save_path=os.path.join(save_dir, "optimized_losses.png") if save else None,
                 show=show,
             )
@@ -403,8 +493,10 @@ class WindFarmOptimizerCLI:
 
         results = {
             "config": {
-                "n_turbines": self.config.n_turbines,
+                "n_turbines": len(self.turbines),
                 "turbine_model": self.config.turbine_model,
+                "turbine_fleet": self.config.turbine_fleet,
+                "fleet_summary": self.config.fleet_summary(),
                 "wake_model": self.config.wake_model,
                 "min_spacing_multiple": self.config.optimization.min_spacing_multiple,
             },
@@ -414,39 +506,44 @@ class WindFarmOptimizerCLI:
             },
         }
 
-        if self.baseline_result is not None:
-            results["baseline"] = {
-                "positions": self.baseline_positions.tolist() if self.baseline_positions is not None else None,
-                "gross_aep_gwh": float(self.baseline_result.gross_aep / 1e3),
-                "net_aep_gwh": float(self.baseline_result.net_aep / 1e3),
-                "wake_loss_pct": float(self.baseline_result.wake_loss_pct),
-                "capacity_factor": float(self.baseline_result.capacity_factor),
-                "turbine_losses": [
+        def _layout_payload(positions, farm_result):
+            return {
+                "positions": positions.tolist() if positions is not None else None,
+                "gross_aep_gwh": float(farm_result.gross_aep / 1e3),
+                "net_aep_gwh": float(farm_result.net_aep / 1e3),
+                "wake_loss_pct": float(farm_result.wake_loss_pct),
+                "capacity_factor": float(farm_result.capacity_factor),
+                "model_summary": farm_result.model_summary,
+                "turbine_results": [
                     {
+                        "id": tr.turbine_id,
                         "idx": tr.turbine_idx,
+                        "model": tr.name,
+                        "rated_power_mw": float(tr.rated_power_mw),
+                        "position": positions[tr.turbine_idx].tolist()
+                        if positions is not None else None,
+                        "gross_aep_mwh": float(tr.gross_aep),
+                        "net_aep_mwh": float(tr.net_aep),
                         "wake_loss_pct": float(tr.wake_loss_pct),
-                        "dominant_source": tr.dominant_wake_source,
+                        "capacity_factor_pct": float(tr.capacity_factor),
+                        "dominant_source": (
+                            farm_result.turbine_results[tr.dominant_wake_source].turbine_id
+                            if tr.dominant_wake_source is not None else None
+                        ),
                     }
-                    for tr in self.baseline_result.turbine_results
+                    for tr in farm_result.turbine_results
                 ],
             }
 
-        if self.optimized_result is not None:
-            results["optimized"] = {
-                "positions": self.optimized_positions.tolist() if self.optimized_positions is not None else None,
-                "gross_aep_gwh": float(self.optimized_result.gross_aep / 1e3),
-                "net_aep_gwh": float(self.optimized_result.net_aep / 1e3),
-                "wake_loss_pct": float(self.optimized_result.wake_loss_pct),
-                "capacity_factor": float(self.optimized_result.capacity_factor),
-                "turbine_losses": [
-                    {
-                        "idx": tr.turbine_idx,
-                        "wake_loss_pct": float(tr.wake_loss_pct),
-                        "dominant_source": tr.dominant_wake_source,
-                    }
-                    for tr in self.optimized_result.turbine_results
-                ],
-            }
+        if self.baseline_positions is not None and self.baseline_result is not None:
+            results["baseline"] = _layout_payload(
+                self.baseline_positions, self.baseline_result
+            )
+
+        if self.optimized_positions is not None and self.optimized_result is not None:
+            results["optimized"] = _layout_payload(
+                self.optimized_positions, self.optimized_result
+            )
 
         if self.economic_result is not None:
             results["economic"] = {
@@ -456,21 +553,24 @@ class WindFarmOptimizerCLI:
                 "npv_yiyuan": float(self.economic_result.npv / 1e4) if self.economic_result.npv is not None else None,
                 "irr_pct": float(self.economic_result.irr) if self.economic_result.irr is not None else None,
                 "payback_years": float(self.economic_result.payback_period) if self.economic_result.payback_period is not None else None,
+                "model_breakdown": self.economic_result.model_breakdown,
             }
 
         if self.baseline_result is not None and self.optimized_result is not None:
+            base_net = self.baseline_result.net_aep
+            base_loss_pct = self.baseline_result.wake_loss_pct
             results["improvement"] = {
                 "aep_improvement_pct": float(
-                    (self.optimized_result.net_aep - self.baseline_result.net_aep)
-                    / self.baseline_result.net_aep * 100
-                ),
+                    (self.optimized_result.net_aep - base_net)
+                    / base_net * 100
+                ) if base_net > 0 else 0.0,
                 "additional_aep_gwh": float(
-                    (self.optimized_result.net_aep - self.baseline_result.net_aep) / 1e3
+                    (self.optimized_result.net_aep - base_net) / 1e3
                 ),
                 "loss_reduction_pct": float(
-                    (self.baseline_result.wake_loss_pct - self.optimized_result.wake_loss_pct)
-                    / self.baseline_result.wake_loss_pct * 100
-                ),
+                    (base_loss_pct - self.optimized_result.wake_loss_pct)
+                    / base_loss_pct * 100
+                ) if base_loss_pct > 0 else 0.0,
             }
 
         if self.sweep_results is not None:
@@ -503,7 +603,14 @@ class WindFarmOptimizerCLI:
         start_time = time.time()
 
         self._print_header("风电场机位布局优化分析")
-        print(f"  风机: {self.config.turbine_model} x {self.config.n_turbines} 台")
+        if self.config.turbine_fleet:
+            fleet_desc = ", ".join(
+                f"{name} ×{int(info['count'])} ({info['capacity_mw']:.2f} MW)"
+                for name, info in self.config.fleet_summary().items()
+            )
+            print(f"  机队: {fleet_desc}，共 {len(self.turbines)} 台")
+        else:
+            print(f"  风机: {self.config.turbine_model} x {len(self.turbines)} 台")
         print(f"  尾流模型: {self.config.wake_model}")
         print(f"  平均风速: {self.wind_resource.overall_mean_speed:.2f} m/s")
         print(f"  场地面积: {self.boundary.area / 1e6:.2f} km²")
@@ -578,7 +685,20 @@ def build_argparser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         choices=["V126-3.45MW", "V164-9.5MW"],
-        help="风机型号",
+        help="风机型号（单一机型模式）",
+    )
+
+    parser.add_argument(
+        "--fleet",
+        type=str,
+        default=None,
+        help=(
+            "混合机型机队：传入 JSON 字符串或 JSON 文件路径。"
+            "文件/字符串内容为机队清单，例如 "
+            '\'[{"model": "V126-3.45MW", "count": 8, "id_prefix": "OLD"},'
+            ' {"model": "V164-9.5MW", "count": 4, "id_prefix": "NEW"}]\'；'
+            "也可逐机声明并携带 id/position/自定义机型参数。"
+        ),
     )
 
     parser.add_argument(
@@ -729,6 +849,25 @@ def build_argparser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_fleet_arg(raw: str) -> list[dict]:
+    """解析 --fleet 参数：优先按文件路径读取，否则按 JSON 字符串解析。"""
+    if os.path.exists(raw):
+        with open(raw, "r", encoding="utf-8") as f:
+            spec = json.load(f)
+    else:
+        try:
+            spec = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ConfigError(
+                f"--fleet 参数既不是存在的文件，也不是合法 JSON: {exc}。"
+                "请传入机队清单 JSON 文件路径，或直接传入 JSON 字符串，"
+                '例如 \'[{"model": "V126-3.45MW", "count": 8}]\'。'
+            ) from exc
+    if not isinstance(spec, list):
+        raise ConfigError("--fleet 清单必须是 JSON 数组（每条记录描述一个机型或一台机组）。")
+    return spec
+
+
 def main() -> int:
     """主函数入口。"""
     parser = build_argparser()
@@ -740,53 +879,65 @@ def main() -> int:
         print(f"示例配置已生成: {os.path.abspath(args.generate_config)}")
         return 0
 
-    if args.config:
-        config = WindFarmConfig.from_json(args.config)
-    else:
-        config = create_sample_config()
-
-    if args.n_turbines is not None:
-        config.n_turbines = args.n_turbines
-    if args.turbine is not None:
-        config.turbine_model = args.turbine
-    if args.wake_model is not None:
-        config.wake_model = args.wake_model
-    if args.wake_decay is not None:
-        config.wake_decay = args.wake_decay
-    if args.boundary is not None:
-        config.boundary_type = args.boundary
-    if args.width is not None:
-        config.boundary_params["width"] = args.width
-    if args.height is not None:
-        config.boundary_params["height"] = args.height
-    if args.min_spacing is not None:
-        config.optimization.min_spacing_multiple = args.min_spacing
-    if args.algorithm is not None:
-        config.optimization.algorithm = args.algorithm
-    if args.population is not None:
-        config.optimization.population_size = args.population
-    if args.iterations is not None:
-        config.optimization.max_iterations = args.iterations
-    if args.seed is not None:
-        config.optimization.seed = args.seed
-    if args.electricity_price is not None:
-        config.economic.electricity_price = args.electricity_price
-    if args.discount_rate is not None:
-        config.economic.discount_rate = args.discount_rate
-    if args.output_dir is not None:
-        config.visualization.save_dir = args.output_dir
-    if args.no_plots:
-        config.visualization.save_plots = False
-    if args.show_plots:
-        config.visualization.show_plots = True
-    if args.no_economic:
-        config.economic.enable_analysis = False
-
-    cli = WindFarmOptimizerCLI(config)
-    cli._min_turbines = args.min_turbines
-    cli._max_turbines = args.max_turbines
-
     try:
+        if args.config:
+            config = WindFarmConfig.from_json(args.config)
+        else:
+            config = create_sample_config()
+
+        if args.fleet is not None:
+            config.turbine_fleet = _load_fleet_arg(args.fleet)
+            config.n_turbines = count_fleet_units(config.turbine_fleet)
+
+        if args.n_turbines is not None:
+            if config.turbine_fleet is not None:
+                raise ConfigError(
+                    "机队模式下不能用 --n-turbines 覆盖数量：请直接修改 "
+                    "turbine_fleet 清单中各机型的 count。"
+                )
+            config.n_turbines = args.n_turbines
+        if args.turbine is not None:
+            config.turbine_model = args.turbine
+        if args.wake_model is not None:
+            config.wake_model = args.wake_model
+        if args.wake_decay is not None:
+            config.wake_decay = args.wake_decay
+        if args.boundary is not None:
+            config.boundary_type = args.boundary
+        if args.width is not None:
+            config.boundary_params["width"] = args.width
+        if args.height is not None:
+            config.boundary_params["height"] = args.height
+        if args.min_spacing is not None:
+            config.optimization.min_spacing_multiple = args.min_spacing
+        if args.algorithm is not None:
+            config.optimization.algorithm = args.algorithm
+        if args.population is not None:
+            config.optimization.population_size = args.population
+        if args.iterations is not None:
+            config.optimization.max_iterations = args.iterations
+        if args.seed is not None:
+            config.optimization.seed = args.seed
+        if args.electricity_price is not None:
+            config.economic.electricity_price = args.electricity_price
+        if args.discount_rate is not None:
+            config.economic.discount_rate = args.discount_rate
+        if args.output_dir is not None:
+            config.visualization.save_dir = args.output_dir
+        if args.no_plots:
+            config.visualization.save_plots = False
+        if args.show_plots:
+            config.visualization.show_plots = True
+        if args.no_economic:
+            config.economic.enable_analysis = False
+
+        # 在任何重计算之前先构造机队，尽早暴露编号/数量/参数错误。
+        config.create_turbines()
+
+        cli = WindFarmOptimizerCLI(config)
+        cli._min_turbines = args.min_turbines
+        cli._max_turbines = args.max_turbines
+
         cli.run_full_analysis(
             run_baseline=True,
             run_opt=not args.no_optimization,
@@ -796,6 +947,9 @@ def main() -> int:
             save=True,
         )
         return 0
+    except (ConfigError, SiteCapacityError) as e:
+        print(f"\n配置错误: {e}", file=sys.stderr)
+        return 2
     except Exception as e:
         print(f"\n错误: {e}", file=sys.stderr)
         import traceback

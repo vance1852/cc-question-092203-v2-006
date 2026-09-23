@@ -1,12 +1,19 @@
 """风电场经济性评估。
 
-简化的度电成本(LCOE)计算模型。
+简化的度电成本(LCOE)计算模型。多机型机队按每台机组所属型号的
+单位容量造价分别汇总。
 """
 
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, Sequence
 
 import numpy as np
+
+
+# 自定义机型（配置文件内联声明）缺省造价参数，取内置两型号的中间水平。
+DEFAULT_CAPITAL_COST_PER_MW = 620.0
+DEFAULT_INSTALLATION_COST_PER_MW = 75.0
+DEFAULT_OM_COST_PER_MW_PER_YEAR = 16.5
 
 
 @dataclass
@@ -100,6 +107,8 @@ class EconomicResult:
     irr: Optional[float]
     payback_period: Optional[float]
     cost_breakdown: dict[str, float]
+    model_breakdown: dict[str, dict] = field(default_factory=dict)
+    """按型号汇总的台数、装机容量(MW)与造价(万元)明细。"""
 
 
 class EconomicAnalyzer:
@@ -372,6 +381,171 @@ class EconomicAnalyzer:
 
         return float(((low + high) / 2) * 100)
 
+    def compute_fleet_capital_cost(
+        self,
+        rated_powers_MW: np.ndarray,
+        cost_models: Optional[dict[str, TurbineCostModel]] = None,
+        model_names: Optional[Sequence[str]] = None,
+    ) -> tuple[float, dict[str, float], dict[str, dict]]:
+        """按机组各自型号的单位容量造价计算初始投资。
+
+        Parameters
+        ----------
+        rated_powers_MW : np.ndarray
+            每台机组的额定功率 (MW)，形状 (N,)
+        cost_models : Optional[dict[str, TurbineCostModel]]
+            型号 -> 造价模型；None 时全部按本分析器的单一造价模型计价，
+            与旧的单一机型流程完全等价
+        model_names : Optional[Sequence[str]]
+            每台机组的型号名，形状 (N,)；None 时视为同一型号
+
+        Returns
+        -------
+        tuple[float, dict[str, float], dict[str, dict]]
+            - 总初始投资 (万元)
+            - 成本分项明细 (万元)
+            - 按型号汇总的台数/容量/造价明细
+        """
+        powers = np.asarray(rated_powers_MW, dtype=np.float64)
+        names = list(model_names) if model_names is not None else [
+            self.turbine_cost.turbine_model
+        ] * len(powers)
+        if len(names) != len(powers):
+            raise ValueError(
+                f"型号序列长度({len(names)})与机组数量({len(powers)})不一致"
+            )
+
+        models = cost_models if cost_models is not None else {
+            self.turbine_cost.turbine_model: self.turbine_cost
+        }
+
+        turbine_capital = 0.0
+        turbine_installation = 0.0
+        total_capacity = 0.0
+        model_breakdown: dict[str, dict] = {}
+
+        for power_mw, name in zip(powers, names):
+            model_cost = models.get(name, self.turbine_cost)
+            turbine_capital += power_mw * model_cost.capital_cost_per_MW
+            turbine_installation += power_mw * model_cost.installation_cost_per_MW
+            total_capacity += power_mw
+
+            item = model_breakdown.setdefault(
+                name,
+                {"count": 0, "capacity_mw": 0.0, "capital_cost": 0.0,
+                 "installation_cost": 0.0},
+            )
+            item["count"] += 1
+            item["capacity_mw"] += float(power_mw)
+            item["capital_cost"] += float(power_mw * model_cost.capital_cost_per_MW)
+            item["installation_cost"] += float(
+                power_mw * model_cost.installation_cost_per_MW
+            )
+
+        grid_connection = total_capacity * self.farm_cost.grid_connection_cost_per_MW
+        site_dev = self.farm_cost.site_development_cost
+        access_road = self.farm_cost.access_road_cost
+
+        total = (
+            turbine_capital
+            + turbine_installation
+            + grid_connection
+            + site_dev
+            + access_road
+        )
+
+        breakdown = {
+            "风机设备": turbine_capital,
+            "风机安装": turbine_installation,
+            "并网工程": grid_connection,
+            "场地开发": site_dev,
+            "道路建设": access_road,
+        }
+
+        return total, breakdown, model_breakdown
+
+    def compute_fleet_annual_om_cost(
+        self,
+        rated_powers_MW: np.ndarray,
+        cost_models: Optional[dict[str, TurbineCostModel]] = None,
+        model_names: Optional[Sequence[str]] = None,
+    ) -> float:
+        """按机组各自型号计算年运维费用。"""
+        powers = np.asarray(rated_powers_MW, dtype=np.float64)
+        names = list(model_names) if model_names is not None else [
+            self.turbine_cost.turbine_model
+        ] * len(powers)
+        models = cost_models if cost_models is not None else {
+            self.turbine_cost.turbine_model: self.turbine_cost
+        }
+
+        total_om = 0.0
+        for power_mw, name in zip(powers, names):
+            model_cost = models.get(name, self.turbine_cost)
+            total_om += power_mw * model_cost.o_and_m_cost_per_MW_per_year
+        return float(total_om)
+
+    def analyze_fleet(
+        self,
+        rated_powers_MW: np.ndarray,
+        net_aep_GWh: float,
+        cost_models: Optional[dict[str, TurbineCostModel]] = None,
+        model_names: Optional[Sequence[str]] = None,
+    ) -> EconomicResult:
+        """对混合机型机队进行完整经济性分析。
+
+        Parameters
+        ----------
+        rated_powers_MW : np.ndarray
+            每台机组额定功率 (MW)
+        net_aep_GWh : float
+            净年发电量 (GWh/year)
+        cost_models : Optional[dict[str, TurbineCostModel]]
+            各型号造价模型
+        model_names : Optional[Sequence[str]]
+            每台机组型号名
+
+        Returns
+        -------
+        EconomicResult
+            经济性分析结果（含按型号明细）
+        """
+        powers = np.asarray(rated_powers_MW, dtype=np.float64)
+
+        total_capital_cost, cost_breakdown, model_breakdown = \
+            self.compute_fleet_capital_cost(powers, cost_models, model_names)
+        annual_om_cost = self.compute_fleet_annual_om_cost(
+            powers, cost_models, model_names
+        )
+        annual_revenue = self.compute_annual_revenue(net_aep_GWh)
+
+        lcoe = self.compute_lcoe(
+            total_capital_cost, annual_om_cost, net_aep_GWh
+        )
+        npv = self.compute_npv(
+            total_capital_cost, annual_revenue, annual_om_cost
+        )
+        irr = self.compute_irr(
+            total_capital_cost, annual_revenue, annual_om_cost
+        )
+        payback = self.compute_payback_period(
+            total_capital_cost, annual_revenue, annual_om_cost
+        )
+
+        return EconomicResult(
+            total_installed_capacity=float(np.sum(powers)),
+            net_aep=float(net_aep_GWh),
+            annual_revenue=float(annual_revenue),
+            lcoe=float(lcoe),
+            total_capital_cost=float(total_capital_cost),
+            total_om_cost_annual=float(annual_om_cost),
+            npv=npv,
+            irr=irr,
+            payback_period=payback,
+            cost_breakdown=cost_breakdown,
+            model_breakdown=model_breakdown,
+        )
+
     def analyze(
         self,
         n_turbines: int,
@@ -394,40 +568,9 @@ class EconomicAnalyzer:
         EconomicResult
             经济性分析结果
         """
-        total_capacity = n_turbines * rated_power_per_turbine_MW
-
-        total_capital_cost, cost_breakdown = self.compute_capital_cost(
-            n_turbines, rated_power_per_turbine_MW
-        )
-        annual_om_cost = self.compute_annual_om_cost(
-            n_turbines, rated_power_per_turbine_MW
-        )
-        annual_revenue = self.compute_annual_revenue(net_aep_GWh)
-
-        lcoe = self.compute_lcoe(
-            total_capital_cost, annual_om_cost, net_aep_GWh
-        )
-        npv = self.compute_npv(
-            total_capital_cost, annual_revenue, annual_om_cost
-        )
-        irr = self.compute_irr(
-            total_capital_cost, annual_revenue, annual_om_cost
-        )
-        payback = self.compute_payback_period(
-            total_capital_cost, annual_revenue, annual_om_cost
-        )
-
-        return EconomicResult(
-            total_installed_capacity=float(total_capacity),
-            net_aep=float(net_aep_GWh),
-            annual_revenue=float(annual_revenue),
-            lcoe=float(lcoe),
-            total_capital_cost=float(total_capital_cost),
-            total_om_cost_annual=float(annual_om_cost),
-            npv=npv,
-            irr=irr,
-            payback_period=payback,
-            cost_breakdown=cost_breakdown,
+        return self.analyze_fleet(
+            rated_powers_MW=np.full(n_turbines, float(rated_power_per_turbine_MW)),
+            net_aep_GWh=net_aep_GWh,
         )
 
 

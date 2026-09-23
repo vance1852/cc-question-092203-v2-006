@@ -1,0 +1,41 @@
+{
+  "_comment": "逐机清单模式：每台机组一条记录，携带稳定编号；可混用内置/自定义机型并预设机位。不提供 position 时由基线/优化自动布置。",
+  "turbine_fleet": [
+    {"id": "WTG-001", "model": "V126-3.45MW", "position": [-900.0, -900.0]},
+    {"id": "WTG-002", "model": "V126-3.45MW", "position": [900.0, -900.0]},
+    {"id": "WTG-003", "model": "V126-3.45MW", "position": [-900.0, 900.0]},
+    {
+      "id": "EXT-001",
+      "model": "EXT-6.0MW",
+      "position": [900.0, 900.0],
+      "_comment_model": "自定义大转子机型：需给出直径/轮毂高/推力系数与额定参数，造价字段可选",
+      "rotor_diameter": 170.0,
+      "hub_height": 110.0,
+      "thrust_coefficient": 0.81,
+      "rated_power_kw": 6000.0,
+      "cut_in_speed": 3.0,
+      "rated_wind_speed": 11.0,
+      "cut_out_speed": 25.0,
+      "capital_cost_per_MW": 700.0,
+      "installation_cost_per_MW": 85.0,
+      "o_and_m_cost_per_MW_per_year": 18.0
+    }
+  ],
+  "wake_model": "jensen",
+  "boundary_type": "rectangular",
+  "boundary_params": {"width": 3200, "height": 3200, "center_x": 0, "center_y": 0},
+  "optimization": {
+    "algorithm": "ga",
+    "population_size": 30,
+    "max_iterations": 60,
+    "min_spacing_multiple": 5.0,
+    "seed": 42
+  },
+  "visualization": {
+    "save_dir": "output_manifest",
+    "save_plots": true,
+    "show_plots": false,
+    "plot_wake_heatmap": true
+  },
+  "economic": {"electricity_price": 0.45, "discount_rate": 0.06, "enable_analysis": true}
+}
